@@ -178,7 +178,15 @@ go run cmd/manager/main.go -v
 
 ## 📝 License
 
-[Add your license here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+The MIT License is a permissive license that allows for:
+- Commercial use
+- Modification
+- Distribution
+- Private use
+
+The only requirement is that the license and copyright notice be included in all copies or substantial portions of the software.
 
 ## 🙏 Acknowledgments
 
