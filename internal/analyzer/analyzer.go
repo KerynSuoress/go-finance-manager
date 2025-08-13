@@ -3,9 +3,14 @@ package analyzer
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,6 +52,13 @@ type Analyzer struct {
 	model      string
 	maxTokens  int
 	httpClient *http.Client
+
+	// Cost-saver / debug controls
+	dryRun         bool
+	debugDir       string
+	onlyFirstChunk bool
+	maxRequests    int
+	requestsMade   int
 }
 
 // NewAnalyzer creates a new analyzer instance
@@ -61,17 +73,64 @@ func NewAnalyzer() (*Analyzer, error) {
 		return nil, fmt.Errorf("CLAUDE_API_KEY environment variable is required")
 	}
 
-	// Use Claude Sonnet 4 as default model
-	model := "claude-sonnet-4-20250514" // Latest model
+	// Use Claude Sonnet 4 as default model; allow override via env
+	model := os.Getenv("CLAUDE_MODEL")
+	if strings.TrimSpace(model) == "" {
+		model = "claude-sonnet-4-20250514"
+	}
 
-	maxTokens := 4096 // Default max tokens
+	// Reasonable output token cap; allow override via env
+	maxTokens := 2048
+	if v := os.Getenv("CLAUDE_MAX_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxTokens = n
+		}
+	}
+
+	// HTTP timeout (in seconds) can be overridden via env var
+	timeoutSeconds := 120
+	if v := os.Getenv("CLAUDE_HTTP_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			timeoutSeconds = n
+		}
+	}
 
 	return &Analyzer{
-		apiKey:     apiKey,
-		model:      model,
-		maxTokens:  maxTokens,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKey:         apiKey,
+		model:          model,
+		maxTokens:      maxTokens,
+		httpClient:     &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second},
+		dryRun:         false,
+		debugDir:       "",
+		onlyFirstChunk: false,
+		maxRequests:    0,
+		requestsMade:   0,
 	}, nil
+}
+
+// EnableDryRun toggles dry-run mode (no external API calls; responses are mocked)
+func (a *Analyzer) EnableDryRun(d bool) { a.dryRun = d }
+
+// SetDebugDir sets a directory where request/response JSON will be saved
+func (a *Analyzer) SetDebugDir(dir string) { a.debugDir = strings.TrimSpace(dir) }
+
+// SetOnlyFirstChunk restricts processing to the first prompt chunk per file
+func (a *Analyzer) SetOnlyFirstChunk(b bool) { a.onlyFirstChunk = b }
+
+// SetMaxRequests caps total external API requests (0 = unlimited)
+func (a *Analyzer) SetMaxRequests(n int) {
+	if n >= 0 {
+		a.maxRequests = n
+	}
+}
+
+func (a *Analyzer) saveDebugFile(prefix string, data []byte) {
+	if strings.TrimSpace(a.debugDir) == "" {
+		return
+	}
+	_ = os.MkdirAll(a.debugDir, 0755)
+	fname := fmt.Sprintf("%s/%s_%s.json", a.debugDir, prefix, time.Now().Format("20060102_150405_000000"))
+	_ = os.WriteFile(fname, data, 0644)
 }
 
 // CategorizeTransactions uses Claude API to categorize all transactions
@@ -83,8 +142,8 @@ func (a *Analyzer) CategorizeTransactions(transactions []*models.Transaction) er
 
 	fmt.Printf("Categorizing %d transactions using Claude API...\n", len(transactions))
 
-	// Process transactions in batches to avoid rate limits
-	batchSize := 100
+	// Process transactions in batches to avoid rate limits and token overflows
+	batchSize := 30
 	for i := 0; i < len(transactions); i += batchSize {
 		end := i + batchSize
 		if end > len(transactions) {
@@ -110,35 +169,40 @@ func (a *Analyzer) CategorizeTransactions(transactions []*models.Transaction) er
 func (a *Analyzer) ExtractTransactionsFromText(text string, source string) ([]*models.Transaction, error) {
 	fmt.Printf("Extracting transactions from PDF text using Claude API...\n")
 
-	// Build prompt for transaction extraction
-	prompt := a.buildExtractionPrompt(text, source)
-
-	// Call Claude API
-	request := ClaudeAPIRequest{
-		Model:       a.model,
-		MaxTokens:   a.maxTokens,
-		Temperature: 0.1, // Low temperature for consistent extraction
-		Messages: []Message{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
+	// For very large statements, split into manageable chunks to avoid timeouts
+	chunkSize := 12000
+	if v := os.Getenv("EXTRACTION_CHUNK_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 1000 {
+			chunkSize = n
+		}
+	}
+	chunks := splitTextForExtraction(text, chunkSize)
+	if a.onlyFirstChunk && len(chunks) > 1 {
+		chunks = chunks[:1]
+	}
+	if len(chunks) > 1 {
+		fmt.Printf("Large statement detected. Splitting into %d chunks...\n", len(chunks))
 	}
 
-	response, err := a.callClaudeAPI(request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to call Claude API: %v", err)
+	var allTransactions []*models.Transaction
+	for i, chunk := range chunks {
+		if len(chunks) > 1 {
+			fmt.Printf("Processing chunk %d/%d...\n", i+1, len(chunks))
+		}
+
+		transactions, err := a.extractFromChunkRecursive(chunk, source, i+1, len(chunks), 0)
+		if err != nil {
+			return nil, err
+		}
+		allTransactions = append(allTransactions, transactions...)
+
+		if i < len(chunks)-1 {
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
-	// Parse the response to extract transactions
-	transactions, err := a.parseExtractionResponse(response, source)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse extraction response: %v", err)
-	}
-
-	fmt.Printf("✓ Extracted %d transactions from PDF text\n", len(transactions))
-	return transactions, nil
+	fmt.Printf("✓ Extracted %d transactions from PDF text\n", len(allTransactions))
+	return allTransactions, nil
 }
 
 // buildExtractionPrompt creates a prompt for transaction extraction from PDF text
@@ -157,7 +221,7 @@ func (a *Analyzer) buildExtractionPrompt(text string, source string) string {
 	sb.WriteString(text)
 	sb.WriteString("\n\n")
 
-	sb.WriteString("Extract all transactions and respond in JSON format like this:\n")
+	sb.WriteString("Extract all transactions and respond ONLY with a JSON array (no preface, no explanation, no code fences). Format exactly like this:\n")
 	sb.WriteString("[\n")
 	sb.WriteString("  {\n")
 	sb.WriteString("    \"date\": \"2025-01-15\",\n")
@@ -175,52 +239,211 @@ func (a *Analyzer) buildExtractionPrompt(text string, source string) string {
 	sb.WriteString("- For example: if you see 'RESTAURANT ABC -1000' and 'RESTAURANT ABC +1000' on the same date, skip both\n")
 	sb.WriteString("- If you see 'RESTAURANT ABC -1000' and 'RESTAURANT ABC +500' on the same date, include only the net: 'RESTAURANT ABC -500'\n")
 	sb.WriteString("- If no transactions are found, return an empty array []\n")
+	sb.WriteString("- Do not include any commentary, headings, or markdown. Output must be a JSON array only.\n")
 
 	return sb.String()
+}
+
+// buildExtractionPromptWithChunk is like buildExtractionPrompt but adds chunk context
+func (a *Analyzer) buildExtractionPromptWithChunk(text string, source string, chunkIndex int, totalChunks int) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("You are extracting transactions from a bank statement. This is chunk %d of %d. Only extract transactions that appear in this chunk. Do not infer transactions from other parts.\n\n", chunkIndex, totalChunks))
+	sb.WriteString(a.buildExtractionPrompt(text, source))
+	return sb.String()
+}
+
+// extractFromChunkRecursive attempts to extract transactions from a text chunk.
+// If the model returns non-JSON output, it splits the chunk and retries recursively up to a small depth.
+func (a *Analyzer) extractFromChunkRecursive(chunk string, source string, chunkIndex int, totalChunks int, depth int) ([]*models.Transaction, error) {
+	// Safety: limit recursion depth
+	if depth > 3 {
+		return nil, fmt.Errorf("failed to parse extraction response after multiple attempts")
+	}
+
+	prompt := a.buildExtractionPromptWithChunk(chunk, source, chunkIndex, totalChunks)
+	request := ClaudeAPIRequest{
+		Model:       a.model,
+		MaxTokens:   a.maxTokens,
+		Temperature: 0.1,
+		Messages: []Message{{
+			Role:    "user",
+			Content: prompt,
+		}},
+	}
+
+	response, err := a.callClaudeAPI(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call Claude API: %v", err)
+	}
+
+	transactions, parseErr := a.parseExtractionResponse(response, source)
+	if parseErr == nil {
+		return transactions, nil
+	}
+
+	// If parse failed and the chunk is large enough, split and retry recursively
+	if len(chunk) > 6000 {
+		fmt.Printf("Parse failed on chunk (len=%d). Splitting and retrying...\n", len(chunk))
+		mid := len(chunk) / 2
+		left := chunk[:mid]
+		right := chunk[mid:]
+		leftTx, _ := a.extractFromChunkRecursive(left, source, chunkIndex, totalChunks, depth+1)
+		rightTx, _ := a.extractFromChunkRecursive(right, source, chunkIndex, totalChunks, depth+1)
+		combined := append(leftTx, rightTx...)
+		if len(combined) > 0 {
+			return combined, nil
+		}
+	}
+
+	// Log a small snippet for diagnostics
+	if len(response.Content) > 0 {
+		msg := response.Content[0].Text
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		fmt.Printf("Model returned non-JSON output (first 200 chars): %s\n", strings.ReplaceAll(msg, "\n", " "))
+	}
+
+	return nil, fmt.Errorf("failed to parse extraction response: %v", parseErr)
 }
 
 // Add this function to extract JSON from Claude's response
 func extractJSONFromResponse(content string) (string, error) {
 	content = strings.TrimSpace(content)
 
-	// Handle Haiku format: "Based on the statement, here are the extracted transactions:\n["
-	// Look for the first [ to start JSON
-	jsonStart := strings.Index(content, "[")
-	if jsonStart != -1 {
-		// Find the last ] to end JSON
-		jsonEnd := strings.LastIndex(content, "]")
-		if jsonEnd != -1 && jsonEnd > jsonStart {
-			return content[jsonStart : jsonEnd+1], nil
+	// Helper: extract first well-formed JSON array by bracket matching, ignoring text inside quotes
+	findJSONArray := func(s string) (string, bool) {
+		inString := false
+		escaped := false
+		depth := 0
+		start := -1
+		for i, r := range s {
+			ch := byte(r)
+			if inString {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if ch == '\\' {
+					escaped = true
+					continue
+				}
+				if ch == '"' {
+					inString = false
+				}
+				continue
+			}
+			if ch == '"' {
+				inString = true
+				continue
+			}
+			if ch == '[' {
+				if depth == 0 {
+					start = i
+				}
+				depth++
+			} else if ch == ']' {
+				if depth > 0 {
+					depth--
+					if depth == 0 && start != -1 {
+						return s[start : i+1], true
+					}
+				}
+			}
+		}
+		return "", false
+	}
+
+	if arr, ok := findJSONArray(content); ok {
+		return arr, nil
+	}
+
+	// Fallback: look inside fenced code blocks
+	if start := strings.Index(content, "```json"); start != -1 {
+		if end := strings.Index(content[start+7:], "```"); end != -1 { // 7 = len("```json")
+			block := content[start+7 : start+7+end]
+			if arr, ok := findJSONArray(block); ok {
+				return arr, nil
+			}
+		}
+	}
+	if start := strings.Index(content, "```"); start != -1 {
+		if end := strings.Index(content[start+3:], "```"); end != -1 { // 3 = len("```")
+			block := content[start+3 : start+3+end]
+			if arr, ok := findJSONArray(block); ok {
+				return arr, nil
+			}
 		}
 	}
 
-	// Fallback: Handle Sonnet format with ```json blocks
-	start := strings.Index(content, "```json")
-	if start == -1 {
-		start = strings.Index(content, "```")
-		if start == -1 {
-			return "", fmt.Errorf("no JSON block found in response")
+	return "", fmt.Errorf("no JSON array found in response")
+}
+
+// buildJSONArrayFromObjects scans the content for standalone JSON objects and
+// returns a synthesized JSON array string composed of those objects.
+// This is a last-resort fallback when the model outputs multiple objects without wrapping them in an array.
+func buildJSONArrayFromObjects(content string) (string, error) {
+	// Strip code fences if present to reduce noise
+	cleaned := content
+	if i := strings.Index(cleaned, "```"); i != -1 {
+		// remove all fenced blocks
+		re := regexp.MustCompile("```[a-zA-Z]*[\\s\\S]*?```")
+		cleaned = re.ReplaceAllString(cleaned, "")
+	}
+
+	inString := false
+	escaped := false
+	depth := 0
+	start := -1
+	var objects []string
+	for i := 0; i < len(cleaned); i++ {
+		ch := cleaned[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			continue
+		}
+		if ch == '{' {
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		} else if ch == '}' {
+			if depth > 0 {
+				depth--
+				if depth == 0 && start != -1 {
+					objects = append(objects, cleaned[start:i+1])
+					start = -1
+				}
+			}
 		}
 	}
 
-	// Find the start of actual JSON (after the ```json)
-	jsonStart = strings.Index(content[start:], "[")
-	if jsonStart == -1 {
-		return "", fmt.Errorf("no JSON array found in response")
-	}
-	jsonStart += start
-
-	// Find the end of JSON block
-	end := strings.Index(content[jsonStart:], "```")
-	if end == -1 {
-		end = strings.LastIndex(content, "]")
-		if end == -1 {
-			return "", fmt.Errorf("no closing bracket found in JSON")
-		}
-		return content[jsonStart : end+1], nil
+	if len(objects) == 0 {
+		return "", fmt.Errorf("no standalone JSON objects found")
 	}
 
-	return content[jsonStart : jsonStart+end], nil
+	// Join objects into a JSON array
+	array := "[" + strings.Join(objects, ",") + "]"
+	// quick sanity check
+	var tmp []map[string]interface{}
+	if err := json.Unmarshal([]byte(array), &tmp); err != nil {
+		return "", fmt.Errorf("failed to validate synthesized JSON array: %v", err)
+	}
+	return array, nil
 }
 
 // parseExtractionResponse parses the Claude API response to extract transactions
@@ -235,7 +458,12 @@ func (a *Analyzer) parseExtractionResponse(response *ClaudeAPIResponse, source s
 	// Extract just the JSON part
 	jsonContent, err := extractJSONFromResponse(content)
 	if err != nil {
-		return nil, fmt.Errorf("failed to extract JSON from response: %v", err)
+		// Fallback: try to build an array from individual JSON objects
+		if fallback, ferr := buildJSONArrayFromObjects(content); ferr == nil {
+			jsonContent = fallback
+		} else {
+			return nil, fmt.Errorf("failed to extract JSON from response: %v", err)
+		}
 	}
 
 	// Try to parse as JSON
@@ -288,9 +516,9 @@ func (a *Analyzer) categorizeBatch(transactions []*models.Transaction) error {
 
 	// Create the API request
 	request := ClaudeAPIRequest{
-		Model:       "claude-3-5-haiku-latest",
+		Model:       a.model, // use same configured model for consistency
 		MaxTokens:   a.maxTokens,
-		Temperature: 0.3, // Low temperature for consistent categorization
+		Temperature: 0.2, // Slightly lower temp for deterministic labels
 		Messages: []Message{
 			{
 				Role:    "user",
@@ -313,7 +541,7 @@ func (a *Analyzer) categorizeBatch(transactions []*models.Transaction) error {
 func (a *Analyzer) buildCategorizationPrompt(transactions []*models.Transaction) string {
 	var sb strings.Builder
 
-	sb.WriteString("You are a financial transaction categorizer. Analyze the following transactions and categorize each one with a main category and subcategory. If you are not completely sure about the category, use the 'Other' category, otherwise, Use standard financial categories like:\n\n")
+	sb.WriteString("You are a financial transaction categorizer. Analyze the following transactions and categorize each one with a main category and subcategory. If you are not completely sure about the category, use 'Other'. Use standard financial categories like:\n\n")
 	sb.WriteString("- Food & Dining (Restaurants, Groceries, Fast Food, Coffee)\n")
 	sb.WriteString("- Transportation (Gas, Public Transit, Ride Sharing, Parking)\n")
 	sb.WriteString("- Shopping (Clothing, Electronics, Home & Garden, Online Shopping)\n")
@@ -332,7 +560,7 @@ func (a *Analyzer) buildCategorizationPrompt(transactions []*models.Transaction)
 	sb.WriteString("2. Subcategory (specific type within the main category)\n")
 	sb.WriteString("3. Confidence level (0.0 to 1.0, where 1.0 is very confident)\n\n")
 
-	sb.WriteString("Respond in JSON format like this:\n")
+	sb.WriteString("Respond ONLY with a JSON array (no preface, no explanation). Format like this:\n")
 	sb.WriteString("[\n")
 	sb.WriteString("  {\n")
 	sb.WriteString("    \"index\": 0,\n")
@@ -342,7 +570,7 @@ func (a *Analyzer) buildCategorizationPrompt(transactions []*models.Transaction)
 	sb.WriteString("  }\n")
 	sb.WriteString("]\n\n")
 
-	sb.WriteString("Here are the transactions to categorize:\n\n")
+	sb.WriteString("Here are the transactions to categorize in index order (use the index to map your output):\n\n")
 
 	for i, tx := range transactions {
 		sb.WriteString(fmt.Sprintf("%d. Date: %s | Description: %s | Amount: %.2f | Type: %s\n",
@@ -359,34 +587,128 @@ func (a *Analyzer) callClaudeAPI(request ClaudeAPIRequest) (*ClaudeAPIResponse, 
 		return nil, fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	// Create HTTP request
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
+	// Cost-control: respect max requests cap
+	if a.maxRequests > 0 && a.requestsMade >= a.maxRequests {
+		return nil, fmt.Errorf("request limit reached (%d)", a.maxRequests)
+	}
+	a.requestsMade++
+
+	// Debug: save request
+	a.saveDebugFile("request", jsonData)
+
+	if a.dryRun {
+		// Return an empty array as a harmless mock to test the pipeline without cost
+		mock := &ClaudeAPIResponse{
+			Type: "message",
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{
+				{Type: "text", Text: "[]"},
+			},
+		}
+		respBytes, _ := json.Marshal(mock)
+		a.saveDebugFile("response_mock", respBytes)
+		return mock, nil
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", a.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(jsonData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %v", err)
+		}
 
-	// Make the request
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make API request: %v", err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", a.apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+
+		resp, err := a.httpClient.Do(req)
+		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() && attempt < 3 {
+				backoff := time.Duration(attempt*2) * time.Second
+				fmt.Printf("Transient timeout from Claude API (attempt %d). Retrying in %s...\n", attempt, backoff)
+				time.Sleep(backoff)
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("failed to make API request: %v", err)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read response body: %v", readErr)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var response ClaudeAPIResponse
+			if err := json.Unmarshal(body, &response); err != nil {
+				return nil, fmt.Errorf("failed to decode response: %v", err)
+			}
+			// Debug: save response
+			a.saveDebugFile("response", body)
+			return &response, nil
+		}
+
+		// Retry on 429/5xx
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && attempt < 3 {
+			backoff := time.Duration(attempt*2) * time.Second
+			fmt.Printf("Claude API returned status %d (attempt %d). Retrying in %s...\n", resp.StatusCode, attempt, backoff)
+			time.Sleep(backoff)
+			lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			continue
+		}
+
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("unknown error during Claude API call")
 	}
+	return nil, lastErr
+}
 
-	// Parse response
-	var response ClaudeAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
+// splitTextForExtraction splits text into chunks not exceeding approx chunkSize runes.
+// It prefers to split on page boundaries marked by lines beginning with "--- Page ".
+func splitTextForExtraction(text string, chunkSize int) []string {
+	if len(text) <= chunkSize {
+		return []string{text}
 	}
-
-	return &response, nil
+	lines := strings.Split(text, "\n")
+	var chunks []string
+	var current strings.Builder
+	for _, line := range lines {
+		// If adding this line would exceed the chunk size and we are at a page boundary, start a new chunk
+		if current.Len()+len(line)+1 > chunkSize && strings.HasPrefix(strings.TrimSpace(line), "--- Page ") {
+			chunks = append(chunks, current.String())
+			current.Reset()
+		}
+		if current.Len() > 0 {
+			current.WriteString("\n")
+		}
+		current.WriteString(line)
+	}
+	if current.Len() > 0 {
+		chunks = append(chunks, current.String())
+	}
+	// Final safety: if any chunk is still too big, hard-split it
+	var final []string
+	for _, c := range chunks {
+		if len(c) <= chunkSize {
+			final = append(final, c)
+			continue
+		}
+		for start := 0; start < len(c); start += chunkSize {
+			end := start + chunkSize
+			if end > len(c) {
+				end = len(c)
+			}
+			final = append(final, c[start:end])
+		}
+	}
+	return final
 }
 
 // CategorizationResult represents a single categorization result
